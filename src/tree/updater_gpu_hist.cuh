@@ -82,7 +82,7 @@ void AssignNodes(TreeView const& tree, std::vector<ExpandEntry> const& candidate
   }
 }
 
-inline void CalcRootSum(Context const* ctx, linalg::MatrixView<GradientPairInt64> d_gpair,
+inline void CalcRootSum(Context const* ctx, linalg::MatrixView<GradientPairInt64 const> d_gpair,
                         common::Span<GradientPairInt64> root_sum) {
   auto n_samples = d_gpair.Shape(0);
   auto n_targets = d_gpair.Shape(1);
@@ -222,7 +222,7 @@ class MultiTargetHistMaker {
     // Sampling
     this->sampler_.Sample(this->ctx_, this->split_gpair_.View(this->ctx_->Device()),
                           this->split_quantizer_->DeviceSpan());
-    if (!this->value_gpair_.Empty()) {
+    if (GradientContainer::HasValueGrad(this->value_gpair_)) {
       this->value_quantizer_ =
           std::make_unique<GradientQuantiserGroup>(this->ctx_, value_gpair_.View(ctx_->Device()));
       this->sampler_.ApplySampling(this->ctx_, &this->value_gpair_);
@@ -290,7 +290,7 @@ class MultiTargetHistMaker {
 
     CHECK(!h_candidates.empty());
     auto n_targets = this->split_gpair_.Shape(1);
-    dh::device_vector<MultiExpandEntry> candidates{h_candidates};
+    this->evaluator_.PrepareTreeSplit(this->ctx_, h_candidates);
 
     // Candidate spans can become stale while entries wait in the loss-guide queue, so
     // look up the persistent weight storage by node ID.
@@ -329,8 +329,7 @@ class MultiTargetHistMaker {
     }
 
     this->evaluator_.ApplyTreeSplit(this->ctx_, p_tree,
-                                    common::Span<MultiExpandEntry const>{h_candidates},
-                                    dh::ToSpan(candidates), n_targets);
+                                    common::Span<MultiExpandEntry const>{h_candidates}, n_targets);
   }
   /**
    * @brief Calculate output weights using value gradients and finalize prediction leaves.
@@ -339,7 +338,7 @@ class MultiTargetHistMaker {
    * storing the output weights.
    */
   void FinalizeLeafWeights(RegTree* p_tree) const {
-    CHECK(!this->value_gpair_.Empty());
+    CHECK(GradientContainer::HasValueGrad(this->value_gpair_));
     CHECK(this->value_quantizer_);
     CHECK_EQ(this->value_gpair_.Shape(1), p_tree->NumTargets());
     auto n_leaves = static_cast<bst_target_t>(p_tree->GetNumLeaves());
@@ -362,7 +361,7 @@ class MultiTargetHistMaker {
     for (auto const& p_part : this->partitioners_) {
       auto leaves = p_part->GetLeaves();
       CHECK_EQ(leaves.size(), n_leaves);
-      LeafGradSum(this->ctx_, leaves, d_roundings, p_part->GetRows(), d_full_grad, d_out_sum);
+      LeafGradSum(this->ctx_, leaves, d_roundings, p_part->GetBuffers(), d_full_grad, d_out_sum);
       if (batch_idx == 0) {
         // Populate the node indices
         std::transform(leaves.begin(), leaves.end(), leaves_idx.begin(),
@@ -646,7 +645,8 @@ class MultiTargetHistMaker {
   void GrowTree(linalg::Matrix<GradientPair>* split_gpair, DMatrix* p_fmat, ObjInfo const*,
                 RegTree* p_tree, HostDeviceVector<bst_node_t>* p_out_position) {
     xgboost_NVTX_FN_RANGE();
-    Driver<MultiExpandEntry> driver{param_, kMaxNodeBatchSize};
+    Driver<MultiExpandEntry> driver{
+        ScaleMinSplitLoss(param_, split_gpair->Shape(1), p_tree->NumTargets()), kMaxNodeBatchSize};
 
     this->Reset(split_gpair, p_fmat);
     driver.Push({this->InitRoot(p_fmat, p_tree)});
